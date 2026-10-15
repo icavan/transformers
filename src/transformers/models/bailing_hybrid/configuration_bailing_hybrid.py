@@ -40,6 +40,8 @@ class BailingHybridConfig(PreTrainedConfig):
         time (speculative decoding via `generate(..., use_mtp=True)`).
     rope_theta (`float`, *optional*, defaults to 6000000.0):
         Base period of the rotary position embeddings used by MLA layers.
+    q_lora_rank (`int`, *optional*, defaults to `None`):
+        Low-rank dimension of the query projection in MLA layers. When unset, queries use a single projection.
     short_conv_kernel_size (`int`, *optional*, defaults to 4):
         Kernel size of the short depthwise convolutions in KDA layers.
     layer_group_size (`int`, *optional*, defaults to 6):
@@ -100,6 +102,7 @@ class BailingHybridConfig(PreTrainedConfig):
     routed_scaling_factor: float = 2.5
 
     kv_lora_rank: int = 512
+    q_lora_rank: int | None = None
     qk_rope_head_dim: int = 64
     v_head_dim: int = 128
     qk_nope_head_dim: int = 128

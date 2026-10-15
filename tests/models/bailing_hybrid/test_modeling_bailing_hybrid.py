@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Testing suite for the PyTorch Ling 3.0 / Bailing MoE V3 model."""
+"""Testing suite for the PyTorch Ling 3 / Bailing MoE V3 model."""
 
+import re
 import tempfile
 import unittest
 from unittest import mock
@@ -45,6 +46,7 @@ class BailingHybridModelTester(CausalLMModelTester):
         # Keep the KDA head size distinct from the MLA RoPE size to cover config save/load semantics.
         self.head_dim = 24
         self.kv_lora_rank = 16
+        self.q_lora_rank = None
         self.qk_nope_head_dim = 32
         self.qk_rope_head_dim = 16
         self.v_head_dim = 32
@@ -108,6 +110,7 @@ class BailingHybridModelTest(CausalLMModelTest, unittest.TestCase):
     def test_reverse_loading_mapping(self):
         """Exercise the two-stage Ling key mapping as an end-to-end exact round trip."""
         config, _ = self.model_tester.prepare_config_and_inputs_for_common()
+        config.q_lora_rank = 12
         model = BailingHybridForCausalLM(config)
 
         with tempfile.TemporaryDirectory() as tmpdirname:
@@ -122,18 +125,62 @@ class BailingHybridModelTest(CausalLMModelTest, unittest.TestCase):
             "model.layers.0.attention.k_conv1d.weight",
             "model.layers.0.attention.v_conv1d.weight",
             "model.layers.1.attention.dense.weight",
+            "model.layers.1.attention.q_a_layernorm.weight",
+            "model.layers.1.attention.q_a_proj.weight",
+            "model.layers.1.attention.q_b_proj.weight",
             "model.layers.1.mlp.gate.expert_bias",
         }
         self.assertTrue(expected_keys.issubset(saved_keys))
         self.assertNotIn("model.layers.0.self_attn.conv1d.weight", saved_keys)
+        self.assertNotIn("model.layers.1.attention.q_proj.weight", saved_keys)
         state_dict = model.state_dict()
         reloaded_state_dict = reloaded.state_dict()
         self.assertNotEqual(config.linear_head_dim, config.qk_rope_head_dim)
         self.assertEqual(reloaded.config.linear_head_dim, config.linear_head_dim)
         self.assertEqual(reloaded.config.qk_rope_head_dim, config.qk_rope_head_dim)
+        self.assertEqual(reloaded.config.q_lora_rank, config.q_lora_rank)
         self.assertEqual(state_dict.keys(), reloaded_state_dict.keys())
         for key, value in state_dict.items():
             torch.testing.assert_close(value, reloaded_state_dict[key], rtol=0, atol=0)
+
+    def test_mla_query_projection_variants(self):
+        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+        full_attention_idx = config.layer_types.index("full_attention")
+
+        direct_model = BailingHybridForCausalLM(config)
+        direct_attention = direct_model.model.layers[full_attention_idx].self_attn
+        self.assertIsNotNone(direct_attention.q_proj)
+        self.assertIsNone(direct_attention.q_a_proj)
+        self.assertIsNone(direct_attention.q_a_layernorm)
+        self.assertIsNone(direct_attention.q_b_proj)
+
+        config.q_lora_rank = 12
+        lora_model = BailingHybridForCausalLM(config)
+        lora_attention = lora_model.model.layers[full_attention_idx].self_attn
+        self.assertIsNone(lora_attention.q_proj)
+        self.assertEqual(lora_attention.q_a_proj.weight.shape, (config.q_lora_rank, config.hidden_size))
+        self.assertEqual(lora_attention.q_a_layernorm.weight.shape, (config.q_lora_rank,))
+        self.assertEqual(
+            lora_attention.q_b_proj.weight.shape,
+            (config.num_attention_heads * (config.qk_nope_head_dim + config.qk_rope_head_dim), config.q_lora_rank),
+        )
+        lora_model = lora_model.to(torch_device).eval()
+        with torch.no_grad():
+            outputs = lora_model(**self._prepare_for_class(inputs_dict, BailingHybridForCausalLM))
+        self.assertEqual(outputs.logits.shape[:2], inputs_dict["input_ids"].shape)
+
+    def test_mtp_ignored_keys_follow_configured_layer_count(self):
+        config, _ = self.model_tester.prepare_config_and_inputs_for_common()
+        config.num_nextn_predict_layers = 2
+        model = BailingHybridForCausalLM(config)
+        patterns = model._keys_to_ignore_on_load_unexpected
+
+        for layer_idx in range(config.num_hidden_layers, config.num_hidden_layers + config.num_nextn_predict_layers):
+            key = f"model.layers.{layer_idx}.attention.q_a_proj.weight"
+            self.assertTrue(any(re.search(pattern, key) for pattern in patterns))
+
+        next_main_layer = f"model.layers.{config.num_hidden_layers - 1}.attention.q_a_proj.weight"
+        self.assertFalse(any(re.search(pattern, next_main_layer) for pattern in patterns))
 
     def test_recurrent_layers_mask_padding_on_continued_forward(self):
         # Ling's MoE and KDA chunk boundaries amplify harmless split-vs-full accumulation differences to roughly
