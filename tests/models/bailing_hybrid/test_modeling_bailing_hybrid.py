@@ -27,9 +27,12 @@ from ...causal_lm_tester import CausalLMModelTest, CausalLMModelTester
 if is_torch_available():
     import torch
     from safetensors.torch import load_file
+    from torch import nn
 
-    from transformers import BailingHybridForCausalLM, BailingHybridModel
+    from transformers import BailingHybridConfig, BailingHybridForCausalLM, BailingHybridModel, FineGrainedFP8Config
     from transformers.generation.utils import ALL_CACHE_NAMES
+    from transformers.integrations.finegrained_fp8 import FP8Linear
+    from transformers.quantizers.quantizer_finegrained_fp8 import FineGrainedFP8HfQuantizer
 
 
 class BailingHybridModelTester(CausalLMModelTester):
@@ -168,6 +171,42 @@ class BailingHybridModelTest(CausalLMModelTest, unittest.TestCase):
         with torch.no_grad():
             outputs = lora_model(**self._prepare_for_class(inputs_dict, BailingHybridForCausalLM))
         self.assertEqual(outputs.logits.shape[:2], inputs_dict["input_ids"].shape)
+
+    def test_fp8_mixed_precision_modules(self):
+        config, _ = self.model_tester.prepare_config_and_inputs_for_common()
+        checkpoint_quantization_config = {
+            "quant_method": "fp8",
+            "modules_to_not_convert": [f"model.layers.{config.num_hidden_layers}.eh_proj"],
+            "weight_block_size": [128, 128],
+        }
+        config = BailingHybridConfig.from_dict(
+            {**config.to_dict(), "quantization_config": checkpoint_quantization_config}
+        )
+
+        expected_skips = {
+            "lm_head",
+            "model.layers.0.attention.b_proj",
+            "model.layers.1.attention.g_proj",
+            f"model.layers.{config.num_hidden_layers}.eh_proj",
+        }
+        self.assertEqual(set(config.quantization_config["modules_to_not_convert"]), expected_skips)
+        self.assertEqual(
+            checkpoint_quantization_config["modules_to_not_convert"],
+            [f"model.layers.{config.num_hidden_layers}.eh_proj"],
+        )
+
+        with torch.device("meta"):
+            model = BailingHybridForCausalLM(config)
+        quantizer = FineGrainedFP8HfQuantizer(FineGrainedFP8Config.from_dict(config.quantization_config))
+        quantizer._process_model_before_weight_loading(model)
+
+        linear_attention = model.model.layers[0].self_attn
+        full_attention = model.model.layers[1].self_attn
+        self.assertIs(type(linear_attention.b_proj), nn.Linear)
+        self.assertIsInstance(linear_attention.q_proj, FP8Linear)
+        self.assertIs(type(full_attention.g_proj), nn.Linear)
+        self.assertIsInstance(full_attention.q_proj, FP8Linear)
+        self.assertIs(type(model.lm_head), nn.Linear)
 
     def test_mtp_ignored_keys_follow_configured_layer_count(self):
         config, _ = self.model_tester.prepare_config_and_inputs_for_common()

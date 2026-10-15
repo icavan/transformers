@@ -191,6 +191,19 @@ class BailingHybridConfig(DeepseekV3Config):
 
         super().__post_init__(**kwargs)
 
+        # FP8 Ling checkpoints keep the small attention gates and output head in BF16.
+        quantization_config = getattr(self, "quantization_config", None)
+        if isinstance(quantization_config, dict) and quantization_config.get("quant_method") == "fp8":
+            quantization_config = quantization_config.copy()
+            modules_to_not_convert = list(quantization_config.get("modules_to_not_convert") or [])
+            modules_to_not_convert.append("lm_head")
+            modules_to_not_convert.extend(
+                f"model.layers.{layer_idx}.attention.{'g_proj' if layer_type == 'full_attention' else 'b_proj'}"
+                for layer_idx, layer_type in enumerate(self.layer_types)
+            )
+            quantization_config["modules_to_not_convert"] = list(dict.fromkeys(modules_to_not_convert))
+            self.quantization_config = quantization_config
+
 
 class BailingHybridRMSNorm(LlamaRMSNorm):
     pass
